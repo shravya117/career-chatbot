@@ -12,12 +12,16 @@ from config import (
     PORT
 )
 from memory import memory
+from rag import rag
+from pdf_handler import pdf_handler
 from prompts import PROMPTS
 
 
 # Initialize Flask app
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = 'uploads'
 
 # Configure Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
@@ -88,19 +92,29 @@ class ChatbotManager:
     def generate_response(self, 
                          system_prompt: str,
                          conversation_history: str,
-                         user_message: str) -> str:
+                         user_message: str,
+                         use_rag: bool = True) -> str:
         """
-        Generate a response using Gemini API
+        Generate a response using Gemini API with RAG
         
         Args:
             system_prompt: The system prompt/instructions
             conversation_history: Previous conversation context
             user_message: Current user message
+            use_rag: Whether to use RAG for retrieval
             
         Returns:
             Generated response from the model
         """
+        rag_context = ""
+        if use_rag:
+            # Retrieve relevant documents from RAG
+            retrieved_docs = rag.retrieve_documents(user_message, limit=5)
+            rag_context = rag.format_context(retrieved_docs)
+        
         full_prompt = f"""{system_prompt}
+
+{rag_context}
 
 --- CONVERSATION HISTORY ---
 {conversation_history if conversation_history else "(No previous conversation)"}
@@ -140,6 +154,69 @@ def api_new_chat():
 def api_chat():
     """API route for continuing chat (same as /chats)"""
     return chat()
+
+
+@app.route('/api/upload-pdf', methods=['POST'])
+def upload_pdf():
+    """Upload and process a PDF file with tech validation"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files['file']
+        user_id = request.form.get('user_id')
+        
+        if not file or file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        
+        if not file.filename.lower().endswith('.pdf'):
+            return jsonify({"error": "Only PDF files are allowed"}), 400
+        
+        # Step 1: Save and extract PDF
+        pdf_data = pdf_handler.save_pdf(file, user_id)
+        
+        # Step 2: Check if tech-related
+        tech_check = pdf_handler.is_tech_related(
+            pdf_data['full_text'],
+            pdf_data['filename']
+        )
+        
+        # If not tech-related, reject it
+        if not tech_check['is_tech']:
+            return jsonify({
+                "pdf_id": pdf_data['pdf_id'],
+                "filename": pdf_data['filename'],
+                "is_tech_related": False,
+                "confidence": tech_check['confidence'],
+                "reason": tech_check['reason'],
+                "message": "I only review tech-related PDFs. This document doesn't appear to contain tech content like programming, AI, data science, cybersecurity, or other tech domains."
+            }), 400
+        
+        # Step 3: Process to RAG (only if tech-related)
+        status_msg = pdf_handler.process_pdf_to_rag(
+            pdf_data['pdf_id'],
+            pdf_data['full_text'],
+            pdf_data['filename']
+        )
+        
+        return jsonify({
+            "pdf_id": pdf_data['pdf_id'],
+            "filename": pdf_data['filename'],
+            "text_preview": pdf_data['text_preview'],
+            "pages": pdf_data['metadata']['pages'],
+            "is_tech_related": True,
+            "confidence": tech_check['confidence'],
+            "tech_keywords_found": tech_check['tech_keywords_found'],
+            "status": status_msg,
+            "message": f"✓ PDF '{pdf_data['filename']}' has been uploaded successfully! It's recognized as a tech document. Now ask questions about it!"
+        }), 201
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 # ENDPOINTS
@@ -291,7 +368,8 @@ def chat():
         response = chatbot.generate_response(
             system_prompt=system_prompt,
             conversation_history=conversation_history,
-            user_message=user_message
+            user_message=user_message,
+            use_rag=True
         )
         
         # Save assistant response to memory
@@ -307,6 +385,46 @@ def chat():
             "session_type": session_type,
             "conversation_history": full_history,
             "timestamp": datetime.now().isoformat()
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# PDF UPLOAD ENDPOINTS
+
+@app.route('/api/user-pdfs/<user_id>', methods=['GET'])
+def get_user_pdfs(user_id):
+    """Get all PDFs uploaded by a user"""
+    try:
+        pdfs = pdf_handler.get_user_pdfs(user_id)
+        
+        return jsonify({
+            "user_id": user_id,
+            "pdfs": pdfs,
+            "count": len(pdfs)
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/search-pdf-content', methods=['POST'])
+def search_pdf_content():
+    """Search within uploaded PDF content"""
+    try:
+        data = request.get_json()
+        query = data.get('query')
+        
+        if not query:
+            return jsonify({"error": "query is required"}), 400
+        
+        results = rag.retrieve_documents(query, category="user_pdf", limit=5)
+        
+        return jsonify({
+            "query": query,
+            "results": results,
+            "count": len(results)
         }), 200
     
     except Exception as e:
