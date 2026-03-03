@@ -18,7 +18,7 @@ MAX_CONVERSATION_MESSAGES = int(os.getenv('MAX_CONVERSATION_MESSAGES', '10'))
 
 # Flask App Configuration
 HOST = os.getenv('HOST', '0.0.0.0')
-PORT = int(os.getenv('PORT', '5000'))
+PORT = int(os.getenv('PORT', '5005'))
 
 # Validation
 if not GEMINI_API_KEY:
